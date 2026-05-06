@@ -178,6 +178,116 @@ def _parse_runners(live_data: dict) -> dict:
     return runners
 
 
+def _parse_sp_removal_from_plays(sp_id: int, side: str, all_plays: list) -> Optional[dict]:
+    """
+    Parse play-by-play to find when the SP was removed, the score at that moment,
+    and the fate of any inherited runners.
+
+    Returns a removal_info dict, or None if the SP is still pitching / hasn't pitched.
+    """
+    # Find the last at-bat the SP pitched
+    last_sp_idx = None
+    for i, play in enumerate(all_plays):
+        if play.get("matchup", {}).get("pitcher", {}).get("id") == sp_id:
+            last_sp_idx = i
+
+    if last_sp_idx is None:
+        return None  # SP hasn't pitched yet
+
+    last_sp_play = all_plays[last_sp_idx]
+    inning = last_sp_play["about"]["inning"]
+    half = last_sp_play["about"]["halfInning"]  # "top" or "bottom"
+
+    # If the SP's last play is the last play in the game they're a CG candidate
+    if last_sp_idx == len(all_plays) - 1:
+        return None
+
+    # If the next play is also the SP, they haven't been removed yet
+    next_pitcher_id = all_plays[last_sp_idx + 1].get("matchup", {}).get("pitcher", {}).get("id")
+    if next_pitcher_id == sp_id:
+        return None
+
+    # Score from the SP's last at-bat result
+    result = last_sp_play["result"]
+    if side == "away":
+        sp_score = result.get("awayScore", 0)
+        opp_score = result.get("homeScore", 0)
+    else:
+        sp_score = result.get("homeScore", 0)
+        opp_score = result.get("awayScore", 0)
+
+    # Simulate base state through all plays up to and including SP's last.
+    # Reset at each half-inning boundary — runners LOB don't get explicit "out"
+    # events in the play-by-play, so without resetting we'd carry phantom runners.
+    bases: dict[int, str] = {}
+    current_half_key: tuple | None = None
+    for play in all_plays[: last_sp_idx + 1]:
+        half_key = (play["about"]["inning"], play["about"]["halfInning"])
+        if half_key != current_half_key:
+            bases = {}
+            current_half_key = half_key
+        for entry in play.get("runners", []):
+            movement = entry.get("movement", {})
+            details = entry.get("details", {})
+            runner_id = details.get("runner", {}).get("id")
+            if not runner_id:
+                continue
+            end_base = movement.get("end")
+            if movement.get("isOut") or end_base in (None, "score"):
+                bases.pop(runner_id, None)
+            elif end_base in ("1B", "2B", "3B"):
+                bases[runner_id] = end_base
+
+    inherited_ids: set[int] = set(bases.keys())
+
+    # Track outcomes for inherited runners in subsequent plays of the same half-inning
+    runners_scored = 0
+    accounted: set[int] = set()
+
+    for play in all_plays[last_sp_idx + 1 :]:
+        if play["about"]["inning"] != inning or play["about"]["halfInning"] != half:
+            break
+        for entry in play.get("runners", []):
+            movement = entry.get("movement", {})
+            details = entry.get("details", {})
+            runner_id = details.get("runner", {}).get("id")
+            if runner_id not in inherited_ids or runner_id in accounted:
+                continue
+            if details.get("isScoringEvent"):
+                runners_scored += 1
+                accounted.add(runner_id)
+            elif movement.get("isOut"):
+                accounted.add(runner_id)  # put out — counts as LOB
+
+    # Determine if the removal inning has definitively ended by checking whether
+    # any later play belongs to a different half-inning.
+    inning_ended = any(
+        p["about"]["inning"] > inning
+        or (p["about"]["inning"] == inning and p["about"]["halfInning"] != half)
+        for p in all_plays[last_sp_idx + 1 :]
+    )
+    outstanding = set() if inning_ended else (inherited_ids - accounted)
+    runners_lob = len(inherited_ids) - runners_scored - len(outstanding)
+
+    log.info(
+        "SP removed (plays): %s (%s) — %s of inning %s, score %s-%s, "
+        "%d inherited (%d scored, %d LOB, %d outstanding)",
+        sp_id, side, half, inning, sp_score, opp_score,
+        len(inherited_ids), runners_scored, runners_lob, len(outstanding),
+    )
+
+    return {
+        "inning": inning,
+        "half": half,
+        "sp_score": sp_score,
+        "opp_score": opp_score,
+        "runner_ids": inherited_ids,
+        "runners_scored": runners_scored,
+        "runners_lob": runners_lob,
+        "runners_outstanding": outstanding,
+    }
+
+
 def _team_abbrev(side: str, game_data: dict) -> str:
     teams = game_data.get("gameData", {}).get("teams", {})
     return teams.get(side, {}).get("abbreviation", side.upper())
@@ -229,10 +339,7 @@ def parse_game_state(game_pk: int, live_data: dict, prev_state: Optional[GamePit
         current_outs=current_outs,
     )
 
-    # Carry over runner tracking from previous state
-    if prev_state:
-        state.removal_info = prev_state.removal_info.copy()
-        # We'll rebuild runners below from live data
+    all_plays = live.get("plays", {}).get("allPlays", [])
 
     for side in ("home", "away"):
         sp_info = _get_starting_pitcher_info(side, boxscore, {})
@@ -243,36 +350,13 @@ def parse_game_state(game_pk: int, live_data: dict, prev_state: Optional[GamePit
         if current_id:
             state.current_pitcher[side] = current_id
 
-        # Detect SP removal: SP was pitching last tick, no longer current pitcher
-        sp_id = state.starting_pitcher.get(side, {}).get("id")
-        if sp_id and sp_id != current_id and side not in state.removal_info:
-            # SP has been removed — record the inning/half and current runners on base
-            # The "responsible" runners are whoever is currently on base for the pitching side
-            # (runners the SP put on who the reliever inherited)
-            current_runners_on = _parse_runners(live_data)
-            # Filter to runners the SP put on — we assume any runner currently on base
-            # at the moment of removal is the SP's responsibility (standard baseball scoring)
-            home_runs = _linescore_runs("home", linescore)
-            away_runs = _linescore_runs("away", linescore)
-            state.removal_info[side] = {
-                "inning": current_inning,
-                "half": current_half,
-                "runner_ids": set(current_runners_on.keys()),
-                "sp_score": home_runs if side == "home" else away_runs,
-                "opp_score": away_runs if side == "home" else home_runs,
-            }
-            log.info(
-                "SP removed: %s (%s) — inning %s %s, %d runners inherited",
-                sp_info.get("name"),
-                side,
-                current_half,
-                current_inning,
-                len(current_runners_on),
-            )
-
-    # Update runner tracking: carry forward, merging with live state
-    live_runners = _parse_runners(live_data)
-    state.runners = live_runners
+        # Use play-by-play to determine removal details — accurate for both
+        # live games (plays so far) and completed games.
+        sp_id = (sp_info or {}).get("id")
+        if sp_id:
+            removal = _parse_sp_removal_from_plays(sp_id, side, all_plays)
+            if removal:
+                state.removal_info[side] = removal
 
     return state
 
@@ -280,91 +364,36 @@ def parse_game_state(game_pk: int, live_data: dict, prev_state: Optional[GamePit
 def _is_sp_line_final(side: str, state: GamePitcherState) -> bool:
     """
     Return True if the starting pitcher's line is considered final.
-    See spec for logic.
     """
     sp_id = state.starting_pitcher.get(side, {}).get("id")
     if not sp_id:
         return False
 
     game_over = state.game_status in ("Final", "Game Over", "Completed Early")
+    sp_still_pitching = (state.current_pitcher.get(side) == sp_id)
 
-    current_pitcher_id = state.current_pitcher.get(side)
-    sp_still_pitching = (current_pitcher_id == sp_id)
-
-    # Complete game: SP is still pitching when game ends
     if sp_still_pitching and game_over:
-        return True
-
-    # SP hasn't been removed yet and game isn't over
+        return True   # complete game
     if sp_still_pitching:
+        return False  # still in, game live
+
+    removal = state.removal_info.get(side)
+    if not removal:
+        return False  # removal not yet detected in play-by-play
+
+    # Any inherited runners still on base means inning is ongoing
+    if removal.get("runners_outstanding"):
         return False
 
-    # SP was never set as current pitcher (game data gap) — not final
-    if side not in state.removal_info:
-        return False
-
-    removal = state.removal_info[side]
-    responsible_runner_ids = removal["runner_ids"]
-
-    # No runners inherited — line is immediately final
-    if not responsible_runner_ids:
-        return True
-
-    # Check if inning has advanced past the removal inning
-    removal_inning = removal["inning"]
-    removal_half = removal["half"]
-
-    inning_ended = (
-        state.current_inning > removal_inning
-        or (state.current_inning == removal_inning and state.current_half != removal_half)
-    ) or game_over
-
-    if inning_ended:
-        return True
-
-    # Inning still in progress — check if all responsible runners are gone from bases
-    still_on_base = responsible_runner_ids & set(state.runners.keys())
-    if not still_on_base:
-        return True
-
-    return False
+    return True  # removed, and no outstanding inherited runners
 
 
-def _count_responsible_runner_fates(side: str, state: GamePitcherState, boxscore: dict) -> tuple[int, int, int]:
-    """
-    Returns (scored, lob, outstanding) for SP-responsible runners.
-    - scored: inherited runners that scored (charged to SP as ER)
-    - lob: inherited runners left on base when inning ended
-    - outstanding: still on base, inning in progress
-    """
-    if side not in state.removal_info:
-        return 0, 0, 0
-
-    responsible_ids = state.removal_info[side]["runner_ids"]
-    if not responsible_ids:
-        return 0, 0, 0
-
-    still_on = responsible_ids & set(state.runners.keys())
-    gone = responsible_ids - still_on
-
-    removal_inning = state.removal_info[side]["inning"]
-    removal_half = state.removal_info[side]["half"]
-
-    inning_over = (
-        state.current_inning > removal_inning
-        or (state.current_inning == removal_inning and state.current_half != removal_half)
-        or state.game_status in ("Final", "Game Over", "Completed Early")
-    )
-
-    outstanding = len(still_on) if not inning_over else 0
-    lob = len(still_on) if inning_over else 0
-
-    # "gone" runners either scored or were put out — we can't easily distinguish
-    # without parsing play-by-play. Use a best-effort: if ER increased after removal,
-    # attribute those to the SP. For simplicity we'll count "gone" as scored for display
-    # purposes (the boxscore ER stat already handles actual scoring).
-    scored = len(gone)
-
+def _count_responsible_runner_fates(side: str, state: GamePitcherState) -> tuple[int, int, int]:
+    """Returns (scored, lob, outstanding) for SP-responsible runners, from play-by-play data."""
+    removal = state.removal_info.get(side, {})
+    scored = removal.get("runners_scored", 0)
+    lob = removal.get("runners_lob", 0)
+    outstanding = len(removal.get("runners_outstanding", set()))
     return scored, lob, outstanding
 
 
@@ -408,7 +437,7 @@ def build_pitcher_line(side: str, state: GamePitcherState, live_data: dict) -> O
         sp_score = removal.get("sp_score", 0)
         opp_score = removal.get("opp_score", 0)
 
-    scored, lob, outstanding = _count_responsible_runner_fates(side, state, boxscore)
+    scored, lob, outstanding = _count_responsible_runner_fates(side, state)
 
     return PitcherLine(
         pitcher_id=sp_id,
