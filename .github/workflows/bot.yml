@@ -1,0 +1,45 @@
+name: Pitcher Bot
+
+on:
+  schedule:
+    # Every 5 minutes, 12pm–1am ET (16:00–05:00 UTC)
+    - cron: "*/5 16-23 * * *"
+    - cron: "*/5 0-5 * * *"
+  workflow_dispatch:  # allow manual runs
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Restore state file from previous run
+      - name: Restore posted_starters cache
+        uses: actions/cache@v4
+        with:
+          path: posted_starters.json
+          key: posted-starters-${{ github.run_id }}
+          restore-keys: |
+            posted-starters-
+
+      - name: Run bot (single pass)
+        env:
+          BLUESKY_HANDLE: ${{ secrets.BLUESKY_HANDLE }}
+          BLUESKY_APP_PASSWORD: ${{ secrets.BLUESKY_APP_PASSWORD }}
+        run: python bot.py --once
+
+      # Save state file so next run picks it up
+      - name: Save posted_starters cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: posted_starters.json
+          key: posted-starters-${{ github.run_id }}
