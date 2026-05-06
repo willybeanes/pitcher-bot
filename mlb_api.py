@@ -198,11 +198,12 @@ def _parse_sp_removal_from_plays(sp_id: int, side: str, all_plays: list) -> Opti
     inning = last_sp_play["about"]["inning"]
     half = last_sp_play["about"]["halfInning"]  # "top" or "bottom"
 
-    # Home SPs pitch in bottom half-innings; away SPs pitch in top half-innings.
-    # Only plays in the SP's own half count as evidence of removal.
-    # If we see no subsequent plays in the SP's pitching half, they simply haven't
-    # taken the mound for the next inning yet — don't mistake this for removal.
-    sp_half = "bottom" if side == "home" else "top"
+    # Home SPs pitch in top half-innings (facing away batters).
+    # Away SPs pitch in bottom half-innings (facing home batters).
+    # Only plays in the SP's own pitching half count as evidence of removal.
+    # If we see no subsequent plays in that half, they simply haven't taken
+    # the mound for the next inning yet — don't mistake this for removal.
+    sp_half = "top" if side == "home" else "bottom"
     subsequent_same_half = [
         p for p in all_plays[last_sp_idx + 1 :]
         if p["about"]["halfInning"] == sp_half and p["about"].get("isComplete", False)
@@ -515,7 +516,7 @@ def format_post(line: PitcherLine) -> str:
             elif s == total_responsible:
                 fate = "both scored" if total_responsible == 2 else "all scored"
             elif lob > 0:
-                fate = f"{s} scored, {lob} LOB"
+                fate = f"{s} scored, {lob} left on base"
             else:
                 fate = f"{s} scored"
             context = f"Left with {line.team_name} {score_ctx} and {total_responsible} {runner_word} on ({fate})."
