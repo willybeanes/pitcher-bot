@@ -21,8 +21,9 @@ class PitcherLine:
     pitcher_id: int
     name: str
     team_abbrev: str
+    team_name: str        # nickname, e.g. "Rangers"
     opponent_abbrev: str
-    is_home: bool  # True = SP's team is home team
+    is_home: bool         # True = SP's team is home team
 
     # Pitching stats (from boxscore)
     ip: float          # innings pitched as decimal (6.1 = 6⅓)
@@ -32,6 +33,10 @@ class PitcherLine:
     walks: int
     strikeouts: int
     pitch_count: int
+
+    # Score when SP exited (or final score for CG)
+    sp_score: int
+    opp_score: int
 
     # Context for the final post
     is_complete_game: bool
@@ -66,9 +71,11 @@ class GamePitcherState:
     current_half: str = "top"   # "top" or "bottom"
     current_outs: int = 0
 
-    # Home/away team abbreviations
+    # Home/away team abbreviations and nicknames
     home_team: str = ""
     away_team: str = ""
+    home_team_name: str = ""   # e.g. "Tigers"
+    away_team_name: str = ""   # e.g. "Red Sox"
 
 
 def fetch_schedule(date_str: str) -> list[dict]:
@@ -176,6 +183,16 @@ def _team_abbrev(side: str, game_data: dict) -> str:
     return teams.get(side, {}).get("abbreviation", side.upper())
 
 
+def _team_name(side: str, game_data: dict) -> str:
+    """Return team nickname (e.g. 'Rangers', 'Red Sox')."""
+    teams = game_data.get("gameData", {}).get("teams", {})
+    return teams.get(side, {}).get("teamName", side.upper())
+
+
+def _linescore_runs(side: str, linescore: dict) -> int:
+    return linescore.get("teams", {}).get(side, {}).get("runs", 0)
+
+
 def parse_game_state(game_pk: int, live_data: dict, prev_state: Optional[GamePitcherState]) -> GamePitcherState:
     """
     Build a GamePitcherState from the live feed.
@@ -191,6 +208,8 @@ def parse_game_state(game_pk: int, live_data: dict, prev_state: Optional[GamePit
 
     home_abbrev = _team_abbrev("home", live_data)
     away_abbrev = _team_abbrev("away", live_data)
+    home_name = _team_name("home", live_data)
+    away_name = _team_name("away", live_data)
 
     current_inning = linescore.get("currentInning", 0)
     current_half_raw = linescore.get("inningHalf", "Top")
@@ -203,6 +222,8 @@ def parse_game_state(game_pk: int, live_data: dict, prev_state: Optional[GamePit
         game_type=game_type,
         home_team=home_abbrev,
         away_team=away_abbrev,
+        home_team_name=home_name,
+        away_team_name=away_name,
         current_inning=current_inning,
         current_half=current_half,
         current_outs=current_outs,
@@ -231,10 +252,14 @@ def parse_game_state(game_pk: int, live_data: dict, prev_state: Optional[GamePit
             current_runners_on = _parse_runners(live_data)
             # Filter to runners the SP put on — we assume any runner currently on base
             # at the moment of removal is the SP's responsibility (standard baseball scoring)
+            home_runs = _linescore_runs("home", linescore)
+            away_runs = _linescore_runs("away", linescore)
             state.removal_info[side] = {
                 "inning": current_inning,
                 "half": current_half,
                 "runner_ids": set(current_runners_on.keys()),
+                "sp_score": home_runs if side == "home" else away_runs,
+                "opp_score": away_runs if side == "home" else home_runs,
             }
             log.info(
                 "SP removed: %s (%s) — inning %s %s, %d runners inherited",
@@ -363,8 +388,8 @@ def build_pitcher_line(side: str, state: GamePitcherState, live_data: dict) -> O
     outs_pitched = stats.get("outs", 0)
     ip_float, ip_str = _outs_to_ip_str(outs_pitched)
 
-    opponent_side = "home" if side == "away" else "away"
     team_abbrev = state.home_team if side == "home" else state.away_team
+    team_name = state.home_team_name if side == "home" else state.away_team_name
     opp_abbrev = state.away_team if side == "home" else state.home_team
 
     current_pitcher_id = state.current_pitcher.get(side)
@@ -374,12 +399,22 @@ def build_pitcher_line(side: str, state: GamePitcherState, live_data: dict) -> O
     removal_inning = removal.get("inning", 0)
     removal_half = removal.get("half", "top")
 
+    # For CGs use final score from linescore; otherwise use score captured at removal
+    live_ls = live.get("linescore", {})
+    if is_cg:
+        sp_score = _linescore_runs(side, live_ls)
+        opp_score = _linescore_runs("away" if side == "home" else "home", live_ls)
+    else:
+        sp_score = removal.get("sp_score", 0)
+        opp_score = removal.get("opp_score", 0)
+
     scored, lob, outstanding = _count_responsible_runner_fates(side, state, boxscore)
 
     return PitcherLine(
         pitcher_id=sp_id,
         name=sp_info["name"],
         team_abbrev=team_abbrev,
+        team_name=team_name,
         opponent_abbrev=opp_abbrev,
         is_home=(side == "home"),
         ip=ip_float,
@@ -389,6 +424,8 @@ def build_pitcher_line(side: str, state: GamePitcherState, live_data: dict) -> O
         walks=stats.get("baseOnBalls", 0),
         strikeouts=stats.get("strikeOuts", 0),
         pitch_count=stats.get("numberOfPitches", 0),
+        sp_score=sp_score,
+        opp_score=opp_score,
         is_complete_game=is_cg,
         removal_inning=removal_inning,
         removal_half=removal_half,
@@ -406,15 +443,20 @@ def format_post(line: PitcherLine) -> str:
         f"{line.walks} BB {line.strikeouts} K {line.pitch_count} pitches"
     )
 
-    at_symbol = "@"
-    # "SP's team @ opponent"
-    matchup = f"({line.team_abbrev}) {at_symbol}{line.opponent_abbrev}"
+    vs = "vs" if line.is_home else "@"
+    matchup = f"({line.team_abbrev}) {vs} {line.opponent_abbrev}"
 
     if line.is_complete_game:
         context = "Threw a complete game."
     else:
-        half_label = "top" if line.removal_half == "top" else "bottom"
-        ordinal = _ordinal(line.removal_inning)
+        # Score relation from SP's team perspective
+        sp, opp = line.sp_score, line.opp_score
+        if sp > opp:
+            score_ctx = f"ahead {sp}-{opp}"
+        elif opp > sp:
+            score_ctx = f"behind {opp}-{sp}"
+        else:
+            score_ctx = f"tied {sp}-{opp}"
 
         total_responsible = (
             line.responsible_runners_scored
@@ -423,25 +465,25 @@ def format_post(line: PitcherLine) -> str:
         )
 
         if total_responsible == 0:
-            context = f"Left in {half_label} of {ordinal} with no runners on."
+            context = f"Left with {line.team_name} {score_ctx}."
         elif line.responsible_runners_lob > 0 and line.responsible_runners_scored == 0:
             runner_word = "runner" if total_responsible == 1 else "runners"
-            context = f"Left in {half_label} of {ordinal} with {total_responsible} {runner_word} on. Inning ended with runners LOB."
+            context = f"Left with {line.team_name} {score_ctx} and {total_responsible} {runner_word} on (LOB)."
         else:
             runner_word = "runner" if total_responsible == 1 else "runners"
             s = line.responsible_runners_scored
             lob = line.responsible_runners_lob
             if s == total_responsible == 1:
-                scored_note = " (scored)"
+                fate = "scored"
             elif s == total_responsible:
-                scored_note = " (both scored)" if total_responsible == 2 else " (all scored)"
+                fate = "both scored" if total_responsible == 2 else "all scored"
             elif lob > 0:
-                scored_note = f" ({s} scored, {lob} LOB)"
+                fate = f"{s} scored, {lob} LOB"
             else:
-                scored_note = f" ({s} scored)"
-            context = f"Left in {half_label} of {ordinal} with {total_responsible} {runner_word} on{scored_note}."
+                fate = f"{s} scored"
+            context = f"Left with {line.team_name} {score_ctx} and {total_responsible} {runner_word} on ({fate})."
 
-    return f"{line.name} {matchup}: {stat_line}. {context}"
+    return f"{line.name} {matchup}: {stat_line} - {context}"
 
 
 def _ordinal(n: int) -> str:

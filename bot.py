@@ -31,15 +31,13 @@ _game_states: dict[int, mlb_api.GamePitcherState] = {}
 
 
 def _today() -> str:
-    # Use ET offset (-4 or -5). Close enough for game scheduling purposes.
-    # For production you'd use pytz/zoneinfo, but we avoid extra deps here.
+    if override := os.environ.get("MLB_DATE", "").strip():
+        return override
     utc_now = datetime.now(timezone.utc)
-    # Approximate ET as UTC-4 (EDT). Games are on ET schedule.
     et_hour = (utc_now.hour - 4) % 24
     if et_hour < 6:
-        # Before 6am ET — probably yesterday's games still wrapping up
         from datetime import timedelta
-        return (date.today()).isoformat()
+        return (date.today() - timedelta(days=1)).isoformat()
     return date.today().isoformat()
 
 
