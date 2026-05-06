@@ -497,7 +497,7 @@ def format_post(line: PitcherLine) -> str:
             context = f"Left with {line.team_name} {score_ctx}."
         elif line.responsible_runners_lob > 0 and line.responsible_runners_scored == 0:
             runner_word = "runner" if total_responsible == 1 else "runners"
-            context = f"Left with {line.team_name} {score_ctx} and {total_responsible} {runner_word} on (LOB)."
+            context = f"Left with {line.team_name} {score_ctx} and {total_responsible} {runner_word} on (left on base)."
         else:
             runner_word = "runner" if total_responsible == 1 else "runners"
             s = line.responsible_runners_scored
