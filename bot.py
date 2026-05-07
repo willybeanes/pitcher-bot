@@ -33,12 +33,15 @@ _game_states: dict[int, mlb_api.GamePitcherState] = {}
 def _today() -> str:
     if override := os.environ.get("MLB_DATE", "").strip():
         return override
+    from datetime import timedelta
     utc_now = datetime.now(timezone.utc)
-    et_hour = (utc_now.hour - 4) % 24
-    if et_hour < 6:
-        from datetime import timedelta
-        return (date.today() - timedelta(days=1)).isoformat()
-    return date.today().isoformat()
+    # Convert to ET (EDT = UTC-4 during baseball season)
+    et_now = utc_now - timedelta(hours=4)
+    et_date = et_now.date()
+    # Before 6am ET, still use previous day (late games still in progress)
+    if et_now.hour < 6:
+        return (et_date - timedelta(days=1)).isoformat()
+    return et_date.isoformat()
 
 
 def process_game(game_pk: int, game_type: str) -> None:
