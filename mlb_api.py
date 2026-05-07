@@ -247,7 +247,17 @@ def _parse_sp_removal_from_plays(sp_id: int, side: str, all_plays: list) -> Opti
             elif end_base in ("1B", "2B", "3B"):
                 bases[runner_id] = end_base
 
-    inherited_ids: set[int] = set(bases.keys())
+    # If there are no subsequent plays in the same half-inning, the SP completed
+    # the inning cleanly (was removed between innings). Any runners in bases are
+    # their own LOB — not inherited by the next pitcher.
+    same_inning_subsequent = [
+        p for p in all_plays[last_sp_idx + 1:]
+        if p["about"]["inning"] == inning and p["about"]["halfInning"] == half
+    ]
+    if not same_inning_subsequent:
+        inherited_ids = set()
+    else:
+        inherited_ids = set(bases.keys())
 
     # Track outcomes for inherited runners in subsequent plays of the same half-inning
     runners_scored = 0
