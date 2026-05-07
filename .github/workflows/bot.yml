@@ -1,11 +1,7 @@
 name: Pitcher Bot
 
 on:
-  schedule:
-    # Every 15 minutes, 12pm–4am ET (16:00–08:00 UTC)
-    - cron: "*/15 16-23 * * *"
-    - cron: "*/15 0-8 * * *"
-  workflow_dispatch:  # allow manual runs
+  workflow_dispatch:  # manual runs only (bot runs continuously on Render)
 
 jobs:
   run-bot:
