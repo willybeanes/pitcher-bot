@@ -2,9 +2,9 @@ name: Pitcher Bot
 
 on:
   schedule:
-    # Every 5 minutes, 12pm–4am ET (16:00–08:00 UTC)
-    - cron: "*/5 16-23 * * *"
-    - cron: "*/5 0-8 * * *"
+    # Every 15 minutes, 12pm–4am ET (16:00–08:00 UTC)
+    - cron: "*/15 16-23 * * *"
+    - cron: "*/15 0-8 * * *"
   workflow_dispatch:  # allow manual runs
 
 jobs:
