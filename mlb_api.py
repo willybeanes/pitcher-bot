@@ -389,14 +389,20 @@ def _is_sp_line_final(side: str, state: GamePitcherState) -> bool:
         return False
 
     game_over = state.game_status in ("Final", "Game Over", "Completed Early")
-    sp_still_pitching = (state.current_pitcher.get(side) == sp_id)
+    current_pitcher = state.current_pitcher.get(side)
+    sp_still_pitching = (current_pitcher == sp_id)
 
-    if sp_still_pitching and game_over:
-        return True   # complete game
+    # Complete game: SP was still pitching when game ended.
+    # Also catches the case where the MLB API clears the linescore pitcher field
+    # after the game ends (current_pitcher becomes None), but no removal was detected.
+    removal = state.removal_info.get(side)
+    is_cg = game_over and (sp_still_pitching or (current_pitcher is None and not removal))
+
+    if is_cg:
+        return True
     if sp_still_pitching:
         return False  # still in, game live
 
-    removal = state.removal_info.get(side)
     if not removal:
         return False  # removal not yet detected in play-by-play
 
@@ -441,7 +447,9 @@ def build_pitcher_line(side: str, state: GamePitcherState, live_data: dict) -> O
     opp_abbrev = state.away_team if side == "home" else state.home_team
 
     current_pitcher_id = state.current_pitcher.get(side)
-    is_cg = (current_pitcher_id == sp_id) and state.game_status in ("Final", "Game Over", "Completed Early")
+    game_over = state.game_status in ("Final", "Game Over", "Completed Early")
+    removal = state.removal_info.get(side)
+    is_cg = game_over and (current_pitcher_id == sp_id or (current_pitcher_id is None and not removal))
 
     removal = state.removal_info.get(side, {})
     removal_inning = removal.get("inning", 0)
