@@ -26,6 +26,7 @@ def get_client() -> Client:
             "BLUESKY_HANDLE and BLUESKY_APP_PASSWORD environment variables must be set."
         )
 
+    log.info("Logging in as %r (password length: %d)", handle, len(password))
     client = Client()
     client.login(handle, password)
     log.info("Logged in to Bluesky as %s", handle)
