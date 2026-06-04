@@ -1,0 +1,19 @@
+services:
+  - type: cron
+    name: pitcher-bot
+    runtime: python
+    # Every 10 min during game hours: 1pm–1am ET (17:00–05:00 UTC, summer EDT)
+    schedule: "*/10 17-23,0-5 * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py --once
+    envVars:
+      - key: BLUESKY_HANDLE
+        sync: false
+      - key: BLUESKY_APP_PASSWORD
+        sync: false
+      # Upstash Redis — required for state to persist between cron runs.
+      # Free tier at upstash.com is more than enough.
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false
